@@ -10,13 +10,11 @@ pipeline = importlib.import_module("ingestion.cognee_pipeline")
 
 
 class HostedCogneeTests(unittest.IsolatedAsyncioTestCase):
-    async def test_hosted_add_cognify_and_search_are_used(self):
+    async def test_hosted_add_and_background_cognify_are_used(self):
         calls: list[tuple[str, dict]] = []
 
         def fake_request(path: str, payload: dict):
             calls.append((path, payload))
-            if path == "search":
-                return {"results": [{"text": "Checkout click preceded the failure."}]}
             return {"pipeline_run_id": "run-1"}
 
         error = pipeline.ErrorEntity(
@@ -37,10 +35,10 @@ class HostedCogneeTests(unittest.IsolatedAsyncioTestCase):
         ):
             roots = await pipeline._cognify_and_infer_root_causes("session-1", "timeline", [error])
 
-        self.assertEqual([call[0] for call in calls], ["add_text", "cognify", "search"])
-        self.assertEqual(calls[2][1]["searchType"], "GRAPH_COMPLETION")
-        self.assertEqual(calls[2][1]["datasets"], ["session_session-1"])
-        self.assertIn("preceded", roots[0].explanation)
+        self.assertEqual([call[0] for call in calls], ["add_text", "cognify"])
+        self.assertTrue(calls[1][1]["runInBackground"])
+        self.assertEqual(calls[1][1]["datasets"], ["session_session-1"])
+        self.assertIn("background", roots[0].explanation)
 
     def test_api_v1_suffix_is_normalized_once(self):
         with patch.dict(os.environ, {

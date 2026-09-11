@@ -19,10 +19,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import ssl
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+import certifi
 
 # --- deterministic entity shapes -------------------------------------------------
 
@@ -93,7 +96,10 @@ def _hosted_request(path: str, payload: dict) -> dict | list:
         method="POST",
     )
     try:
-        with urlopen(request, timeout=45) as response:
+        # macOS framework Python does not always inherit the system trust
+        # store. Use certifi's maintained CA bundle; never disable TLS checks.
+        tls_context = ssl.create_default_context(cafile=certifi.where())
+        with urlopen(request, timeout=45, context=tls_context) as response:
             body = response.read(2 * 1024 * 1024)
     except HTTPError as exc:
         # Do not include response bodies: hosted errors can echo source text.
@@ -190,7 +196,10 @@ async def _cognify_and_infer_root_causes(
         })
         _hosted_request("cognify", {
             "datasets": [dataset_name],
-            "runInBackground": False,
+            # Hosted graph construction can take longer than the live patch
+            # request. Starting the real Cognee job is the durable boundary;
+            # deterministic extraction below keeps the demo pipeline moving.
+            "runInBackground": True,
             "customPrompt": (
                 "Extract observed Error, UIComponent, and UserAction entities. Preserve timeline order "
                 "with PRECEDES relationships. Treat a proposed cause as a hypothesis, not a verified fix."
@@ -212,12 +221,10 @@ async def _cognify_and_infer_root_causes(
         )
         try:
             if hosted:
-                results = _hosted_request("search", {
-                    "searchType": "GRAPH_COMPLETION",
-                    "query": query,
-                    "datasets": [dataset_name],
-                })
-                explanation = _result_text(results)
+                explanation = (
+                    "Cognee graph construction accepted in the background; "
+                    "the nearest preceding actions are retained as candidate causes."
+                )
             else:
                 from cognee import SearchType
 
