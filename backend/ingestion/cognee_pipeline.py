@@ -17,11 +17,12 @@ knowledge graph it builds from the session narrative.
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-
-import cognee
-from cognee import SearchType
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 # --- deterministic entity shapes -------------------------------------------------
 
@@ -63,6 +64,64 @@ class SessionEntities:
 ERROR_KINDS = {"console_error", "runtime_error", "unhandled_rejection", "network_failure"}
 ACTION_KINDS = {"click", "keystroke"}
 CONTEXT_WINDOW = 5  # actions immediately preceding an error, used as candidates
+
+
+def _hosted_cognee_config() -> tuple[str, str, str] | None:
+    base_url = os.environ.get("COGNEE_API_URL", "").rstrip("/")
+    api_key = os.environ.get("COGNEE_API_KEY", "")
+    tenant_id = os.environ.get("COGNEE_TENANT_ID", "")
+    if not (base_url and api_key and tenant_id):
+        return None
+    if base_url.endswith("/api/v1"):
+        base_url = base_url[: -len("/api/v1")]
+    return base_url, api_key, tenant_id
+
+
+def _hosted_request(path: str, payload: dict) -> dict | list:
+    config = _hosted_cognee_config()
+    if config is None:
+        raise RuntimeError("hosted Cognee configuration is incomplete")
+    base_url, api_key, tenant_id = config
+    request = Request(
+        f"{base_url}/api/v1/{path.lstrip('/')}",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "X-Api-Key": api_key,
+            "X-Tenant-Id": tenant_id,
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=45) as response:
+            body = response.read(2 * 1024 * 1024)
+    except HTTPError as exc:
+        # Do not include response bodies: hosted errors can echo source text.
+        raise RuntimeError(f"Cognee {path} returned HTTP {exc.code}") from exc
+    except (URLError, TimeoutError) as exc:
+        raise RuntimeError(f"Cognee {path} was unavailable") from exc
+    if not body:
+        return {}
+    value = json.loads(body)
+    if not isinstance(value, (dict, list)):
+        raise RuntimeError(f"Cognee {path} returned an invalid response")
+    return value
+
+
+def _result_text(value: dict | list) -> str:
+    """Extract a displayable answer without depending on one hosted response version."""
+    queue: list[object] = [value]
+    while queue:
+        current = queue.pop(0)
+        if isinstance(current, str) and current.strip():
+            return current[:2000]
+        if isinstance(current, list):
+            queue.extend(current[:20])
+        elif isinstance(current, dict):
+            for key in ("text", "answer", "result", "results", "data", "search_result"):
+                if key in current:
+                    queue.append(current[key])
+    return "No graph context found for this error."
 
 
 def _extract_deterministic_entities(session_id: str, events: list[dict]) -> tuple[list[ErrorEntity], list[ActionEntity]]:
@@ -122,8 +181,28 @@ async def _cognify_and_infer_root_causes(
 ) -> list[RootCauseEntity]:
     dataset_name = f"session_{session_id}"
 
-    await cognee.add(narrative, dataset_name=dataset_name)
-    await cognee.cognify(datasets=[dataset_name])
+    hosted = _hosted_cognee_config() is not None
+    if hosted:
+        _hosted_request("add_text", {
+            "textData": [narrative],
+            "datasetName": dataset_name,
+            "nodeSet": [session_id, "capture-memory"],
+        })
+        _hosted_request("cognify", {
+            "datasets": [dataset_name],
+            "runInBackground": False,
+            "customPrompt": (
+                "Extract observed Error, UIComponent, and UserAction entities. Preserve timeline order "
+                "with PRECEDES relationships. Treat a proposed cause as a hypothesis, not a verified fix."
+            ),
+        })
+    else:
+        # Import lazily so a hosted-only deployment does not need local Cognee
+        # configuration or an LLM_API_KEY merely to start the API process.
+        import cognee
+
+        await cognee.add(narrative, dataset_name=dataset_name)
+        await cognee.cognify(datasets=[dataset_name])
 
     root_causes: list[RootCauseEntity] = []
     for err in errors:
@@ -132,12 +211,22 @@ async def _cognify_and_infer_root_causes(
             "Answer with the specific preceding action and why."
         )
         try:
-            results = await cognee.search(
-                query_text=query,
-                query_type=SearchType.GRAPH_COMPLETION,
-                datasets=[dataset_name],
-            )
-            explanation = results[0] if results else "No graph context found for this error."
+            if hosted:
+                results = _hosted_request("search", {
+                    "searchType": "GRAPH_COMPLETION",
+                    "query": query,
+                    "datasets": [dataset_name],
+                })
+                explanation = _result_text(results)
+            else:
+                from cognee import SearchType
+
+                results = await cognee.search(
+                    query_text=query,
+                    query_type=SearchType.GRAPH_COMPLETION,
+                    datasets=[dataset_name],
+                )
+                explanation = results[0] if results else "No graph context found for this error."
         except Exception as exc:  # cognee needs an LLM provider configured; degrade gracefully
             explanation = f"Root-cause inference unavailable ({exc}); falling back to nearest preceding actions."
 

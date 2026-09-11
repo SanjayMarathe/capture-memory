@@ -1,105 +1,158 @@
-"""
-Stores the Error/Action/RootCause entities Cognee produced into HydraDB, so
-whoever builds the "what should we fix" half of this project can query them
-back out with client.query(...) instead of re-reading raw session logs.
+"""HydraDB v2 persistence and retrieval for the Person 1 -> Person 2 handoff.
 
-Each entity becomes one HydraDB "memory" (type="memory"), tagged with
-additional_metadata so they can be filtered by session / entity kind later.
+HydraDB's v2 names are ``database`` and ``collection``. The hackathon account
+already provisions ``default-tenant``; all captured entities live in one
+``capture-memory`` collection so Person 2 can query across sessions.
 """
 from __future__ import annotations
 
 import json
-import logging
 import os
-import time
 from functools import lru_cache
+from typing import Any
 
 from hydra_db import HydraDB
-from hydra_db.errors.not_found_error import NotFoundError
 
 from .cognee_pipeline import SessionEntities
 
-log = logging.getLogger("capture-memory")
-
-HYDRA_DATABASE = os.environ.get("HYDRA_DATABASE", "capture-memory")
-
-# HydraDB indexes freshly-ingested memory sources asynchronously; calling
-# update_source_metadata immediately after ingest() can 404 until indexing
-# catches up, so tagging retries with backoff instead of assuming readiness.
-_METADATA_TAG_ATTEMPTS = 8
-_METADATA_TAG_RETRY_DELAY_S = 0.5
+HYDRA_DATABASE = os.environ.get("HYDRA_DATABASE", "default-tenant")
+HYDRA_COLLECTION = os.environ.get("HYDRA_COLLECTION", "capture-memory")
 
 
 @lru_cache
 def _client() -> HydraDB:
-    api_key = os.environ["HYDRA_DB_API_KEY"]  # fail loudly if missing — no silent no-op storage
+    # Prefer the shared Person 2 variable while retaining Person 1's legacy
+    # name. Never include either value in responses or logs.
+    api_key = os.environ.get("HYDRA_API_KEY") or os.environ.get("HYDRA_DB_API_KEY")
+    if not api_key:
+        raise RuntimeError("HYDRA_API_KEY is required")
     return HydraDB(token=api_key)
 
 
-def _ensure_database(client: HydraDB) -> None:
-    existing = client.databases.list()
-    names = getattr(existing.data, "tenant_ids", None) or getattr(existing.data, "ids", [])
-    if HYDRA_DATABASE not in names:
-        client.databases.create(database=HYDRA_DATABASE)
-        # Provisioning is async on HydraDB's side; a hackathon demo can just
-        # eat the first request's latency rather than polling databases.status().
+def _payload(response: Any) -> Any:
+    """Unwrap Fern's runtime handler envelope when present.
+
+    hydradb-sdk 2.1.4's generated high-level annotations and its runtime
+    object disagree for some endpoints. The live API returns
+    ``HandlerEnvelope*.data`` while test doubles and future SDKs may expose
+    the inner payload directly.
+    """
+    data = getattr(response, "data", None)
+    return data if data is not None else response
 
 
-def _memory_payload(session_id: str, kind: str, obj: dict) -> dict:
+def _memory_payload(session_id: str, kind: str, entity_id: str, obj: dict[str, Any]) -> dict[str, Any]:
     return {
-        "text": json.dumps(obj, default=str),
-        # extra fields land in additional_metadata via document_metadata-style
-        # tagging so later queries can filter by session/kind without a full scan
+        "text": json.dumps(obj, default=str, sort_keys=True),
+        "title": f"{kind}:{entity_id}",
+        "infer": False,
+        "additional_metadata": {
+            "session_id": session_id,
+            "kind": kind,
+            "entity_id": entity_id,
+            "schema_version": "1",
+        },
     }
 
 
-def store_entities(session_id: str, entities: SessionEntities) -> dict:
-    client = _client()
-    _ensure_database(client)
+def store_entities(session_id: str, entities: SessionEntities) -> dict[str, Any]:
+    """Queue one HydraDB memory per Cognee-derived entity.
 
-    memories = []
-    metadata = []
-    for e in entities.errors:
-        memories.append(_memory_payload(session_id, "error", vars(e)))
-        metadata.append({"session_id": session_id, "kind": "error", "entity_id": e.id})
-    for a in entities.actions:
-        memories.append(_memory_payload(session_id, "action", vars(a)))
-        metadata.append({"session_id": session_id, "kind": "action", "entity_id": a.id})
-    for r in entities.root_causes:
-        memories.append(_memory_payload(session_id, "root_cause", vars(r)))
-        metadata.append({"session_id": session_id, "kind": "root_cause", "entity_id": r.error_id})
-
-    if not memories:
-        return {"stored": 0}
-
-    resp = client.context.ingest(
-        database=HYDRA_DATABASE,
-        collection=session_id,
-        memories=json.dumps(memories),
-        type="memory",
+    Per-item errors are checked before an ingestion receipt is returned.
+    """
+    memories: list[dict[str, Any]] = []
+    memories.extend(
+        _memory_payload(session_id, "error", entity.id, vars(entity))
+        for entity in entities.errors
+    )
+    memories.extend(
+        _memory_payload(session_id, "action", entity.id, vars(entity))
+        for entity in entities.actions
+    )
+    memories.extend(
+        _memory_payload(session_id, "root_cause", entity.error_id, vars(entity))
+        for entity in entities.root_causes
     )
 
-    # Best-effort per-item metadata tagging; skip silently if the SDK/API
-    # shape doesn't line up — storage having happened is what matters for the demo.
-    results = getattr(resp.data, "results", None) or []
-    source_ids = [item.id for item in results if item.id]
-    for source_id, meta in zip(source_ids, metadata):
-        for attempt in range(1, _METADATA_TAG_ATTEMPTS + 1):
-            try:
-                client.context.update_source_metadata(
-                    id=source_id,
-                    database=HYDRA_DATABASE,
-                    collection=session_id,
-                    additional_metadata=meta,
-                )
-                break
-            except NotFoundError:
-                if attempt == _METADATA_TAG_ATTEMPTS:
-                    log.warning("gave up tagging metadata for %s after %d attempts", source_id, attempt)
-                    break
-                time.sleep(_METADATA_TAG_RETRY_DELAY_S)
-            except Exception:
-                log.exception("failed to tag metadata for %s", source_id)
-                break
+    if not memories:
+        return {
+            "stored": 0,
+            "processing_status": "empty",
+            "database": HYDRA_DATABASE,
+            "collection": HYDRA_COLLECTION,
+            "source_ids": [],
+        }
 
-    return {"stored": len(memories), "database": HYDRA_DATABASE, "collection": session_id}
+    response = _client().context.ingest(
+        database=HYDRA_DATABASE,
+        collection=HYDRA_COLLECTION,
+        memories=json.dumps(memories),
+        type="memory",
+        upsert="true",
+    )
+    results = list(getattr(_payload(response), "results", None) or [])
+    failures = [item for item in results if getattr(item, "error", None)]
+    if failures:
+        raise RuntimeError(f"HydraDB rejected {len(failures)} entity item(s)")
+
+    source_ids = [str(item.id) for item in results if getattr(item, "id", None)]
+    return {
+        "stored": len(source_ids),
+        "queued": len(memories),
+        "processing_status": "queued",
+        "database": HYDRA_DATABASE,
+        "collection": HYDRA_COLLECTION,
+        "source_ids": source_ids,
+    }
+
+
+def recall_entities(
+    query: str,
+    *,
+    session_id: str | None = None,
+    kinds: list[str] | None = None,
+    max_results: int = 10,
+) -> dict[str, Any]:
+    """Retrieve bounded, structured incident context via HydraDB v2 ``/query``."""
+    additional_metadata: dict[str, Any] = {"schema_version": "1"}
+    if session_id:
+        additional_metadata["session_id"] = session_id
+    if kinds:
+        additional_metadata["kind"] = kinds
+
+    response = _client().query(
+        query=query,
+        database=HYDRA_DATABASE,
+        collection=HYDRA_COLLECTION,
+        type="memory",
+        query_by="hybrid",
+        mode="fast",
+        graph_context=True,
+        max_results=max_results,
+        metadata_filters={"additional_metadata": additional_metadata},
+    )
+
+    result = _payload(response)
+    chunks = []
+    for rank, chunk in enumerate(getattr(result, "chunks", None) or [], start=1):
+        content = getattr(chunk, "chunk_content", None) or ""
+        try:
+            entity = json.loads(content)
+        except (json.JSONDecodeError, TypeError):
+            entity = {"text": str(content)[:1000]}
+        chunks.append({
+            "rank": rank,
+            "source_id": getattr(chunk, "id", None),
+            "score": getattr(chunk, "relevancy_score", None),
+            "collection": getattr(chunk, "collection", None),
+            "metadata": getattr(chunk, "additional_metadata", None) or {},
+            "entity": entity,
+        })
+
+    return {
+        "database": HYDRA_DATABASE,
+        "collection": HYDRA_COLLECTION,
+        "count": len(chunks),
+        "chunks": chunks,
+        "graph_context_present": getattr(result, "graph_context", None) is not None,
+    }

@@ -1,4 +1,5 @@
 fastapi
 uvicorn[standard]
+python-dotenv
 cognee
-hydradb-sdk
+hydradb-sdk==2.1.4
