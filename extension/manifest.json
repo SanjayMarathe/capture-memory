@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "Capture + Memory",
+  "version": "0.1.0",
+  "description": "Captures console errors, network failures, and interaction sequences and streams them to the memory backend.",
+  "permissions": ["storage", "scripting", "webNavigation"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["capture.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ],
+  "action": {
+    "default_title": "Capture + Memory",
+    "default_popup": "popup.html"
+  },
+  "icons": {}
+}
