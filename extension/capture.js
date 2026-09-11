@@ -44,89 +44,17 @@
   setInterval(flush, FLUSH_INTERVAL_MS);
   window.addEventListener("beforeunload", flush);
 
-  // ---------- Console errors ----------
-  const origConsoleError = console.error.bind(console);
-  console.error = (...args) => {
-    emit({
-      kind: "console_error",
-      message: safeStringify(args),
-    });
-    origConsoleError(...args);
-  };
-
-  window.addEventListener("error", (e) => {
-    emit({
-      kind: "runtime_error",
-      message: e.message,
-      source: e.filename,
-      line: e.lineno,
-      col: e.colno,
-      stack: e.error && e.error.stack ? String(e.error.stack).slice(0, 2000) : null,
-    });
+  // Fetch/console interception must run in the page's MAIN world. page-hook.js
+  // sends bounded error metadata across this relay; only this isolated script
+  // can access chrome.runtime and forward it to the background worker.
+  const PAGE_EVENT_SOURCE = "capture-memory-page-hook-v1";
+  const PAGE_EVENT_KINDS = new Set(["console_error", "runtime_error", "unhandled_rejection", "network_failure"]);
+  window.addEventListener("message", (message) => {
+    if (message.source !== window || message.data?.source !== PAGE_EVENT_SOURCE) return;
+    const event = message.data?.event;
+    if (!event || typeof event !== "object" || !PAGE_EVENT_KINDS.has(event.kind)) return;
+    emit(event);
   });
-
-  window.addEventListener("unhandledrejection", (e) => {
-    emit({
-      kind: "unhandled_rejection",
-      message: safeStringify([e.reason]),
-    });
-  });
-
-  // ---------- Network failures ----------
-  const origFetch = window.fetch;
-  window.fetch = async (...args) => {
-    const started = Date.now();
-    const req = args[0];
-    const url = typeof req === "string" ? req : req && req.url;
-    try {
-      const res = await origFetch(...args);
-      if (!res.ok) {
-        emit({
-          kind: "network_failure",
-          method: (args[1] && args[1].method) || "GET",
-          url,
-          status: res.status,
-          statusText: res.statusText,
-          durationMs: Date.now() - started,
-        });
-      }
-      return res;
-    } catch (err) {
-      emit({
-        kind: "network_failure",
-        method: (args[1] && args[1].method) || "GET",
-        url,
-        status: 0,
-        statusText: String(err && err.message),
-        durationMs: Date.now() - started,
-      });
-      throw err;
-    }
-  };
-
-  const origXhrOpen = XMLHttpRequest.prototype.open;
-  const origXhrSend = XMLHttpRequest.prototype.send;
-  XMLHttpRequest.prototype.open = function (method, url, ...rest) {
-    this.__cm_method = method;
-    this.__cm_url = url;
-    this.__cm_start = Date.now();
-    return origXhrOpen.call(this, method, url, ...rest);
-  };
-  XMLHttpRequest.prototype.send = function (...args) {
-    this.addEventListener("loadend", () => {
-      if (this.status === 0 || this.status >= 400) {
-        emit({
-          kind: "network_failure",
-          method: this.__cm_method,
-          url: this.__cm_url,
-          status: this.status,
-          statusText: this.statusText,
-          durationMs: Date.now() - this.__cm_start,
-        });
-      }
-    });
-    return origXhrSend.apply(this, args);
-  };
 
   // ---------- Interaction sequence (click / keystroke, privacy-safe) ----------
   function describeTarget(el) {
@@ -175,15 +103,4 @@
     },
     true
   );
-
-  function safeStringify(args) {
-    try {
-      return args
-        .map((a) => (typeof a === "string" ? a : JSON.stringify(a)))
-        .join(" ")
-        .slice(0, 2000);
-    } catch {
-      return "[unserializable]";
-    }
-  }
 })();

@@ -11,6 +11,13 @@
   "content_scripts": [
     {
       "matches": ["http://localhost:3001/*", "http://127.0.0.1:3001/*"],
+      "js": ["page-hook.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true
+    },
+    {
+      "matches": ["http://localhost:3001/*", "http://127.0.0.1:3001/*"],
       "js": ["capture.js"],
       "run_at": "document_start",
       "all_frames": true

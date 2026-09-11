@@ -121,6 +121,21 @@ class HandoffTests(unittest.TestCase):
         self.assertEqual(stored["keyCategory"], "char")
         self.assertNotIn("?", stored["url"])
 
+    def test_network_failure_keeps_redacted_request_path(self):
+        self.main._append_events("network", [{
+            "kind": "network_failure",
+            "t": 2,
+            "url": "http://localhost:3001/checkout",
+            "requestUrl": "http://localhost:3001/api/checkout?token=secret",
+            "method": "POST",
+            "status": 500,
+            "statusText": "Internal Server Error",
+        }])
+
+        stored = json.loads((self.sessions / "network.jsonl").read_text(encoding="utf-8"))
+        self.assertEqual(stored["requestUrl"], "http://localhost:3001/api/checkout")
+        self.assertNotIn("token", stored["requestUrl"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -130,6 +130,7 @@ def _privacy_safe_event(event: dict[str, Any]) -> dict[str, Any]:
     elif kind == "network_failure":
         safe.update({
             "method": _redact_text(event.get("method"), 12),
+            "requestUrl": _safe_url(event.get("requestUrl")),
             "status": int(event.get("status", 0)) if str(event.get("status", 0)).isdigit() else 0,
             "statusText": _redact_text(event.get("statusText"), 160),
             "durationMs": max(0, int(event.get("durationMs", 0))) if str(event.get("durationMs", 0)).isdigit() else 0,
